@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir> <env-dir>
+#
+# Installs Chrome for Testing plus the shared libraries it needs, and caches the
+# fully-extracted result in CACHE_DIR keyed on (stack, Chrome version, package
+# list). On a cache hit the whole step is a directory copy: no network, no apt.
+#
+# Derived from heroku/heroku-buildpack-chrome-for-testing. Differences:
+#   - Tracks the latest STABLE Chrome by default (one small HTTP request per
+#     build); a new release causes one cache miss, then it's cached again.
+#     Set CHROME_FOR_TESTING_VERSION to pin instead. If the version lookup
+#     fails, the last cached version is used rather than failing the build.
+#   - Chromedriver is not installed (Cuprite/Ferrum talk CDP directly).
+#   - Extracted Chrome + libs are cached, not just the .deb archives.
+#   - ldd check fails the build if any shared library is missing.
+
+set -euo pipefail
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+topic() { echo "-----> $*"; }
+indent() { sed -u 's/^/       /'; }
+error() { echo " !     $*" >&2; exit 1; }
+
+topic "Installing Chrome for Testing (cached)"
+
+case "${STACK}" in
+  "heroku-24" | "heroku-26")
+    PACKAGES="fonts-liberation libasound2t64 libatk-bridge2.0-0 libatk1.0-0 libcups2 libgbm1 libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2"
+    ;;
+  *)
+    error "Unsupported STACK '${STACK}'"
+    ;;
+esac
+
+CACHE_ROOT="$CACHE_DIR/chrome-cached"
+
+if [[ -f "$ENV_DIR/CHROME_FOR_TESTING_VERSION" ]]; then
+  VERSION="$(cat "$ENV_DIR/CHROME_FOR_TESTING_VERSION")"
+  echo "Using pinned version $VERSION" | indent
+elif VERSION="$(curl --silent --show-error --fail --retry 3 --retry-connrefused --connect-timeout 10 \
+    "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_STABLE")"; then
+  echo "Resolved STABLE to $VERSION" | indent
+elif [[ -f "$CACHE_ROOT/VERSION" ]]; then
+  # Version endpoint unavailable: carry on with whatever we last installed.
+  VERSION="$(cat "$CACHE_ROOT/VERSION")"
+  echo "Could not resolve STABLE version; falling back to cached $VERSION" | indent
+else
+  error "Could not resolve the STABLE Chrome version and nothing is cached"
+fi
+
+CACHE_KEY="$(echo -n "${STACK}|${VERSION}|${PACKAGES}" | sha256sum | cut -c1-16)"
+CACHE_ENTRY="$CACHE_ROOT/$CACHE_KEY"
+
+CHROME_DIR="$BUILD_DIR/.chrome-for-testing"
+APT_DIR="$BUILD_DIR/.apt"
+
+if [[ -f "$CACHE_ENTRY/.complete" ]]; then
+  echo "Cache hit ($CACHE_KEY), restoring" | indent
+  mkdir -p "$CHROME_DIR" "$APT_DIR"
+  cp -a "$CACHE_ENTRY/chrome/." "$CHROME_DIR/"
+  cp -a "$CACHE_ENTRY/apt/." "$APT_DIR/"
+else
+  echo "Cache miss ($CACHE_KEY), installing from scratch" | indent
+
+  mkdir -p "$CHROME_DIR"
+  echo "Downloading Chrome $VERSION" | indent
+  ZIP="$CHROME_DIR/chrome.zip"
+  curl --silent --show-error --fail --retry 3 --retry-connrefused --connect-timeout 10 \
+    -o "$ZIP" "https://storage.googleapis.com/chrome-for-testing-public/$VERSION/linux64/chrome-linux64.zip"
+  unzip -q -o "$ZIP" -d "$CHROME_DIR"
+  rm -f "$ZIP"
+
+  echo "Downloading Chrome dependencies" | indent
+  APT_WORK="$(mktemp -d)"
+  APT_OPTIONS=(-o debug::nolocking=true -o "dir::cache=$APT_WORK/cache" -o "dir::state=$APT_WORK/state")
+  mkdir -p "$APT_WORK/cache/archives/partial" "$APT_WORK/state/lists/partial"
+  apt-get "${APT_OPTIONS[@]}" -qq update
+  # One resolution for all packages, rather than one apt-get per package.
+  # shellcheck disable=SC2086
+  apt-get "${APT_OPTIONS[@]}" -qq -y -d install --reinstall --no-install-recommends $PACKAGES
+
+  mkdir -p "$APT_DIR"
+  for DEB in "$APT_WORK"/cache/archives/*.deb; do
+    dpkg -x "$DEB" "$APT_DIR/"
+  done
+  rm -rf "$APT_WORK"
+
+  echo "Saving to cache" | indent
+  rm -rf "$CACHE_ROOT"   # keep only the current entry
+  mkdir -p "$CACHE_ENTRY"
+  cp -a "$CHROME_DIR" "$CACHE_ENTRY/chrome"
+  cp -a "$APT_DIR" "$CACHE_ENTRY/apt"
+  echo "$VERSION" > "$CACHE_ROOT/VERSION"
+  touch "$CACHE_ENTRY/.complete"
+fi
+
+mkdir -p "$BUILD_DIR/.profile.d"
+cat > "$BUILD_DIR/.profile.d/000_chrome_apt.sh" <<'EOF'
+export PATH="$HOME/.chrome-for-testing/chrome-linux64:$HOME/.apt/usr/bin:$PATH"
+export LD_LIBRARY_PATH="$HOME/.apt/usr/lib/x86_64-linux-gnu:$HOME/.apt/usr/lib:${LD_LIBRARY_PATH:-}"
+EOF
+
+# Fail the build now, rather than in the middle of the system specs, if Chrome
+# can't find a shared library.
+MISSING="$(LD_LIBRARY_PATH="$APT_DIR/usr/lib/x86_64-linux-gnu:$APT_DIR/usr/lib:${LD_LIBRARY_PATH:-}" \
+  ldd "$CHROME_DIR/chrome-linux64/chrome" | grep 'not found' || true)"
+if [[ -n "$MISSING" ]]; then
+  echo "$MISSING" | indent
+  error "Chrome is missing shared libraries; add the packages that provide them to PACKAGES"
+fi
+
+echo "Installed Chrome for Testing $VERSION" | indent
